@@ -49,7 +49,7 @@
 #define RSSI_MEDIUM -70 // above this: MEDIUM
 #define RSSI_WEAK -85   // below this: ignored entirely, too far to matter
 
-#define SCAN_CYCLE_MS 10000                // presence accounting granularity
+#define SCAN_CYCLE_MS 10000                // how long to scan before updating the display
 #define ROTATION_MS (15UL * 60UL * 1000UL) // Apple key / BLE RPA rotation period
 
 #define DWELL_WATCH_MS (5UL * 60UL * 1000UL)
@@ -61,17 +61,16 @@
 // --- UI sizing --------------------------------------------------------------
 // setTextSize() takes a uint8_t.
 // Bruce's FP/FM/FG are 1/2/3 (i.e. small, medium, large font size)
-#define TITLE_TEXT_SIZE FM
+#define TITLE_TEXT_SIZE FP
 #define ROW_TEXT_SIZE FP
 #define DETAIL_TEXT_SIZE FP
 
 // drawStatusBar() owns y=0..25: clock at (12,12), SD/GPS/BLE icons centred at
 // y=7, divider line at y=25. Anything drawn above UI_TOP lands on top of them.
-#define UI_TOP 28
+#define UI_TOP 25
 
 static CategoryPresence g_presence[TRACKER_TYPE_COUNT];
 static uint16_t g_totalCycles = 0;
-static uint32_t g_startedMs = 0;
 
 // ---------------------------------------------------------------------------
 // Advertisement parsing helpers
@@ -422,7 +421,6 @@ static void resetPresence() {
         c.cycleBestRSSI = RSSI_NONE;
     }
     g_totalCycles = 0;
-    g_startedMs = millis();
 }
 
 static void noteAddress(CategoryPresence &c, const String &address) {
@@ -529,16 +527,16 @@ String getTrackerTypeString(TrackerType type) {
 
 static String getTrackerShortString(TrackerType type) {
     switch (type) {
-        case TRACKER_AIRTAG: return "AIRTAG";
-        case TRACKER_FIND_MY_WITH_OWNER: return "APPLE DEVICE & OWNER";
-        case TRACKER_OTHER_FIND_MY: return "APPLE DEVICE, NO OWNER";
+        case GLASSES_META: return "META GLASSES";
+        case GLASSES_SNAP: return "SNAP GLASSES";
+        case GLASSES_OTHER: return "CAMERA GLASSES";
+        case GLASSES_CAMERA_GENERIC: return "CAMERA GLASSES?";
+        case TRACKER_AIRTAG: return "AIRTAG, NO OWNER";
+        case TRACKER_FIND_MY_WITH_OWNER: return "APPLE + OWNER";
+        case TRACKER_OTHER_FIND_MY: return "OTHER FIND MY";
         case TRACKER_TILE: return "TRACKER TILE";
         case TRACKER_SMARTTAG: return "SMART TAG";
         case TRACKER_AIRPODS: return "AIRPODS";
-        case GLASSES_META: return "META CAMERA GLASSES";
-        case GLASSES_SNAP: return "SNAPCHAT CAMERA GLASSES";
-        case GLASSES_OTHER: return "CAMERA GLASSES";
-        case GLASSES_CAMERA_GENERIC: return "GENERIC CAMERA GLASSES?";
         default: return "?";
     }
 }
@@ -546,7 +544,7 @@ static String getTrackerShortString(TrackerType type) {
 String getProximityString(OwnerProximity prox) {
     switch (prox) {
         case PROXIMITY_NEAR: return "It's close!";
-        case PROXIMITY_MEDIUM: return "Not too far";
+        case PROXIMITY_MEDIUM: return "Nearby.";
         case PROXIMITY_FAR: return "Far away.";
         default: return "--";
     }
@@ -665,17 +663,11 @@ static uint16_t rowColor(TrackerType type, DwellLevel level) {
     return levelColor(level);
 }
 
-// drawStatusBar() prints the clock (or "BRUCE <ver>") at (12,12) in a 60px
-// field. Paint over it without touching the border roundrect at x=5 or the
-// divider line at y=25. The status icons are centred, so they are well clear.
-static void hideStatusClock() { tft.fillRect(7, 7, 72, 17, bruceConfig.bgColor); }
-
 static void drawTrackerDetail(TrackerType type) {
     const CategoryPresence &c = g_presence[type];
 
     tft.fillScreen(bruceConfig.bgColor);
     drawMainBorder();
-    hideStatusClock();
 
     tft.setTextSize(TITLE_TEXT_SIZE);
     tft.setTextColor(isGlassesType(type) ? TFT_RED : bruceConfig.priColor, bruceConfig.bgColor);
@@ -766,22 +758,21 @@ static void openDetailList() {
     options.clear();
 }
 
-#define MONITOR_TITLE_Y UI_TOP
-#define MONITOR_COUNTDOWN_Y (UI_TOP + (TITLE_TEXT_SIZE == FP ? 12 : 18))
+#define MONITOR_TAGLINE_Y (UI_TOP + (TITLE_TEXT_SIZE == FP ? 12 : 18))
+#define MONITOR_COUNTDOWN_Y (MONITOR_TAGLINE_Y + 14)
 #define MONITOR_ROWS_TOP (MONITOR_COUNTDOWN_Y + (ROW_TEXT_SIZE == FP ? 12 : 18))
 #define MONITOR_ROW_STEP (ROW_TEXT_SIZE == FP ? 11 : 18)
 
 static void drawMonitorChrome() {
     tft.fillScreen(bruceConfig.bgColor);
     drawMainBorder();
-    hideStatusClock();
 
-    tft.setTextColor(bruceConfig.priColor, bruceConfig.bgColor);
-    tft.setTextSize(TITLE_TEXT_SIZE);
-    tft.drawCentreString("Being watched??", tftWidth / 2, MONITOR_TITLE_Y, SMOOTH_FONT);
+    tft.setTextSize(FP);
+    tft.drawCentreString(String(BTN_ALIAS) + ": list   Esc: exit", tftWidth / 2, tftHeight - 15, 1);
 
-    tft.setTextSize(FP); // footer stays small: it is a long hint string
-    tft.drawCentreString(String(BTN_ALIAS) + ": list   Esc: exit", tftWidth / 2, tftHeight - 12, 1);
+    tft.setTextSize(FP);
+    tft.setTextColor(TFT_DARKGREY, bruceConfig.bgColor);
+    tft.drawCentreString("Find nearby trackers & ai glasses", tftWidth / 2, MONITOR_TAGLINE_Y, 1);
 }
 
 // Redraws only the countdown line, so the list underneath does not flicker.
@@ -793,9 +784,9 @@ static void drawCountdown(uint32_t msRemaining) {
 
     String bar = "";
     uint32_t total = SCAN_CYCLE_MS / 1000;
-    for (uint32_t i = 0; i < total; i++) bar += (i < secs) ? "|" : ".";
+    for (uint32_t i = 0; i < total; i++) bar += (i < secs) ? "." : " ";
 
-    tft.drawString("Scanning.." + String(secs) + "s " + bar, 10, MONITOR_COUNTDOWN_Y);
+    tft.drawString("Scanning..." + String(secs) + "s " + bar, 10, MONITOR_COUNTDOWN_Y);
 }
 
 static void drawMonitorRows() {
