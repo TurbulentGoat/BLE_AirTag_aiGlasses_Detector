@@ -493,7 +493,8 @@ void displayTrackerInfo(const String &address, const TrackedDevice &device) {
 
 void ble_tracker_detector() {
     tft.fillScreen(bruceConfig.bgColor);
-    displayTextLine("Scanning..");
+    displayTextLine("Scanning...");
+    delay(2000);
 
     trackedDevices.clear();
 
@@ -522,7 +523,7 @@ void ble_tracker_detector() {
         pBLEScan->setMaxResults(0);
         pBLEScan->clearResults();
 
-        displayTextLine("Nearly done... " + String(SCAN_TIME_MS / 1000) + "s...");
+        displayTextLine("Nearly done! " + String(SCAN_TIME_MS / 1000) + "s");
 
         pBLEScan->getResults(SCAN_TIME_MS, false);
         pBLEScan->stop();
