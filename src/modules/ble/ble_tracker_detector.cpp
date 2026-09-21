@@ -4,6 +4,9 @@
 #include "core/utils.h"
 #include "modules/ble/ble_common.h"
 #include <algorithm>
+#if !defined(LITE_VERSION)
+#include "modules/ble/BLE_Suite.h"
+#endif
 
 // --- Bluetooth SIG company identifiers -------------------------------------
 #define APPLE_MFG_ID 0x004C
@@ -37,6 +40,10 @@
 #define RSSI_MEDIUM -70
 #define RSSI_WEAK -85
 #define SCAN_TIME_MS 8000 // made 8 seconds to match ble suite scan time
+
+// NimBLE's default for NimBLEScan::m_maxResults (see the NimBLEScan
+// constructor). Restored on the way out -- see ScanSettingsGuard below.
+#define NIMBLE_DEFAULT_MAX_RESULTS 0xFF
 
 static std::map<String, TrackedDevice> trackedDevices;
 
@@ -410,6 +417,43 @@ class TrackerDeviceCallbacks : public NimBLEScanCallbacks {
 static TrackerDeviceCallbacks trackerCallbacks;
 
 // ---------------------------------------------------------------------------
+// Scan-object state guard
+// ---------------------------------------------------------------------------
+
+// NimBLE keeps a single NimBLEScan instance for the life of the firmware.
+// Bruce's stopBLEStack() calls BLEDevice::deinit() without clearAll, and
+// NimBLEDevice::deinit(false) leaves m_pScan allocated -- so that object, and
+// every setting written to it, survives a teardown and is handed straight back
+// by the next BLEDevice::getScan().
+//
+// ble_scan_setup() re-applies the callbacks, active-scan flag, interval, window
+// and duplicate filter, but it does NOT touch maxResults. Leaving maxResults at
+// 0 here therefore breaks every later scan that reads getResults() -- including
+// Bruce's own BLE Scan menu, whose g_scanCallbacks is an empty class and which
+// relies entirely on the buffered result list. It reports "No devices found"
+// until the board is rebooted.
+//
+// This guard restores the NimBLEScan constructor defaults on every exit path.
+namespace {
+struct ScanSettingsGuard {
+    BLEScan *scan;
+
+    explicit ScanSettingsGuard(BLEScan *s) : scan(s) {}
+
+    ScanSettingsGuard(const ScanSettingsGuard &) = delete;
+    ScanSettingsGuard &operator=(const ScanSettingsGuard &) = delete;
+
+    ~ScanSettingsGuard() {
+        if (scan == nullptr) return;
+        // Passing nullptr restores NimBLE's internal default callbacks, and the
+        // second argument restores the duplicate filter to its default (on).
+        scan->setScanCallbacks(nullptr, false);
+        scan->setMaxResults(NIMBLE_DEFAULT_MAX_RESULTS);
+    }
+};
+} // namespace
+
+// ---------------------------------------------------------------------------
 // UI
 // ---------------------------------------------------------------------------
 
@@ -453,22 +497,44 @@ void ble_tracker_detector() {
 
     trackedDevices.clear();
 
+    // Only tear the stack down at the end if we were the ones who brought it
+    // up. Another module (BLE Suite, BLE HID, the BLE server) may already own
+    // an active session, and killing it from here would drop its connections.
+    bool bleWasActiveBefore = BLEConnected || (BLEDevice::getServer() != nullptr);
+#if !defined(LITE_VERSION)
+    bleWasActiveBefore =
+        bleWasActiveBefore || BLEStateManager::isBLEActive() || BLEStateManager::getActiveClientCount() > 0;
+#endif
+
     if (!ble_scan_setup() || !pBLEScan) { return; }
 
-    pBLEScan->setScanCallbacks(&trackerCallbacks, true);
+    {
+        // Restores maxResults and the callbacks when this block exits, by any
+        // path. See the comment on ScanSettingsGuard above -- without it, the
+        // next module to call getResults() silently sees nothing.
+        ScanSettingsGuard guard(pBLEScan);
 
-    pBLEScan->setMaxResults(0);
-    pBLEScan->clearResults();
+        // true == report duplicates, so RSSI history builds up across the scan.
+        pBLEScan->setScanCallbacks(&trackerCallbacks, true);
 
-    displayTextLine("Nearly done... " + String(SCAN_TIME_MS / 1000) + "s...");
+        // Callback-only mode: process each advert in onResult and buffer
+        // nothing, which keeps heap use flat over a long scan.
+        pBLEScan->setMaxResults(0);
+        pBLEScan->clearResults();
 
-    pBLEScan->getResults(SCAN_TIME_MS, false);
+        displayTextLine("Nearly done... " + String(SCAN_TIME_MS / 1000) + "s...");
 
-    pBLEScan->setScanCallbacks(nullptr, false);
-    pBLEScan->stop();
-    pBLEScan->clearResults();
+        pBLEScan->getResults(SCAN_TIME_MS, false);
+        pBLEScan->stop();
+    } // guard restores the scan object's defaults here
 
-    stopBLEStack();
+    if (!bleWasActiveBefore) {
+#if !defined(LITE_VERSION)
+        if (!BLEStateManager::isBLEActive()) { stopBLEStack(); }
+#else
+        stopBLEStack();
+#endif
+    }
 
     if (trackedDevices.empty()) {
         displayError("Nothing detected");
