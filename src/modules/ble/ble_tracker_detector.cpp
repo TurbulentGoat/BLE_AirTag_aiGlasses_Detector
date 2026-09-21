@@ -36,7 +36,7 @@
 #define RSSI_STRONG -50
 #define RSSI_MEDIUM -70
 #define RSSI_WEAK -85
-#define SCAN_TIME_MS 20000
+#define SCAN_TIME_MS 8000 // made 8 seconds to match ble suite scan time
 
 static std::map<String, TrackedDevice> trackedDevices;
 
@@ -56,8 +56,6 @@ static bool hasServiceUUID16(const NimBLEAdvertisedDevice *d, uint16_t uuid16) {
     return false;
 }
 
-// getManufacturerData() returns the 0xFF AD payload, which starts with the
-// 2-byte little-endian company ID.
 static bool getMfgData(const NimBLEAdvertisedDevice *d, uint16_t &id, std::string &data) {
     if (d->getManufacturerDataCount() == 0) return false;
 
@@ -131,8 +129,8 @@ static bool matchTracker(
                 }
                 return true;
             }
-            // Any other Apple type is Continuity chatter from a phone, watch
-            // or Mac. Not a tracker.
+            // Any other Apple type is Continuity chatter from a
+            // phone, watch or Mac. Not a tracker.
         }
 
         if (mfgId == TILE_MFG_ID) {
@@ -253,8 +251,6 @@ static bool matchGlasses(
     std::string mfg;
     bool haveMfg = getMfgData(device, mfgId, mfg);
 
-    // Strongest single signal: the literal string "META_RB_GLASS" inside Meta's
-    // manufacturer payload.
     if (haveMfg && (mfgId == META_TECH_MFG_ID || mfgId == META_MFG_ID)) {
         if (mfg.find("META_RB_GLASS") != std::string::npos) {
             type = GLASSES_META;
@@ -464,10 +460,11 @@ void ble_tracker_detector() {
     pBLEScan->setMaxResults(0);
     pBLEScan->clearResults();
 
-    displayTextLine("BLE sweep " + String(SCAN_TIME_MS / 1000) + "s...");
+    displayTextLine("Nearly done... " + String(SCAN_TIME_MS / 1000) + "s...");
 
     pBLEScan->getResults(SCAN_TIME_MS, false);
 
+    pBLEScan->setScanCallbacks(nullptr, false);
     pBLEScan->stop();
     pBLEScan->clearResults();
 
