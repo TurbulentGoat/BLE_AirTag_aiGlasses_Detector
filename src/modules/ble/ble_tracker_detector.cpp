@@ -3,9 +3,12 @@
 #include "core/mykeyboard.h"
 #include "core/utils.h"
 #include "modules/ble/ble_common.h"
-#include <algorithm>
 #if !defined(LITE_VERSION)
-#include "modules/ble/BLE_Suite.h"
+#include "modules/ble/BLE_Suite.h" // BLEStateManager
+#endif
+#include <algorithm>
+#ifndef NIMBLE_SCAN_DEFAULT_MAX_RESULTS
+#define NIMBLE_SCAN_DEFAULT_MAX_RESULTS 0xFF
 #endif
 
 // --- Bluetooth SIG company identifiers -------------------------------------
@@ -23,10 +26,14 @@
 // NOTE: 0x00A3 is "Meta Watch Ltd." -- an unrelated legacy smartwatch company.
 // Do not treat it as Meta/Facebook.
 
-// --- Apple manufacturer-data payload types ---------------------------------
-#define APPLE_TYPE_FINDMY 0x12          // Find My / offline finding
-#define APPLE_TYPE_PAIRING 0x07         // Proximity pairing (AirPods, unregistered AirTag)
-#define APPLE_FINDMY_LEN_SEPARATED 0x19 // 25-byte payload = tag away from owner
+// --- Apple offline finding (Find My) ---------------------------------------
+#define APPLE_TYPE_FINDMY 0x12
+#define APPLE_TYPE_PAIRING 0x07 // proximity pairing (AirPods, unregistered tag)
+#define FINDMY_LEN_SEPARATED 0x19
+#define FINDMY_LEN_NEARBY 0x02
+#define FINDMY_STATUS_MAINTAINED_MASK 0x04
+#define FINDMY_STATUS_BATTERY_MASK 0xC0
+#define FINDMY_STATUS_BATTERY_SHIFT 6
 
 // --- 16-bit service UUIDs ---------------------------------------------------
 #define UUID_TILE 0xFEED
@@ -36,16 +43,35 @@
 #define UUID_META_FEB7 0xFEB7
 #define UUID_META_FEB8 0xFEB8
 
-#define RSSI_STRONG -50
-#define RSSI_MEDIUM -70
-#define RSSI_WEAK -85
-#define SCAN_TIME_MS 8000 // made 8 seconds to match ble suite scan time
+// --- Tunables ---------------------------------------------------------------
+#define RSSI_NONE -127
+#define RSSI_STRONG -50 // above this: NEAR
+#define RSSI_MEDIUM -70 // above this: MEDIUM
+#define RSSI_WEAK -85   // below this: ignored entirely, too far to matter
 
-// NimBLE's default for NimBLEScan::m_maxResults (see the NimBLEScan
-// constructor). Restored on the way out -- see ScanSettingsGuard below.
-#define NIMBLE_DEFAULT_MAX_RESULTS 0xFF
+#define SCAN_CYCLE_MS 10000                // presence accounting granularity
+#define ROTATION_MS (15UL * 60UL * 1000UL) // Apple key / BLE RPA rotation period
 
-static std::map<String, TrackedDevice> trackedDevices;
+#define DWELL_WATCH_MS (5UL * 60UL * 1000UL)
+#define DWELL_ALERT_MS ROTATION_MS
+#define DWELL_STRONG_MS (2UL * ROTATION_MS)
+
+#define MISSED_CYCLES_TO_END_RUN 2 // one empty cycle is jitter, not departure
+
+// --- UI sizing --------------------------------------------------------------
+// setTextSize() takes a uint8_t.
+// Bruce's FP/FM/FG are 1/2/3 (i.e. small, medium, large font size)
+#define TITLE_TEXT_SIZE FM
+#define ROW_TEXT_SIZE FP
+#define DETAIL_TEXT_SIZE FP
+
+// drawStatusBar() owns y=0..25: clock at (12,12), SD/GPS/BLE icons centred at
+// y=7, divider line at y=25. Anything drawn above UI_TOP lands on top of them.
+#define UI_TOP 28
+
+static CategoryPresence g_presence[TRACKER_TYPE_COUNT];
+static uint16_t g_totalCycles = 0;
+static uint32_t g_startedMs = 0;
 
 // ---------------------------------------------------------------------------
 // Advertisement parsing helpers
@@ -79,13 +105,24 @@ static bool nameContains(const String &lowerName, const char *needle) {
     return lowerName.indexOf(needle) != -1;
 }
 
+static FindMyBattery decodeBattery(uint8_t status) {
+    if ((status & FINDMY_STATUS_MAINTAINED_MASK) == 0) return FINDMY_BATT_UNKNOWN;
+
+    switch ((status & FINDMY_STATUS_BATTERY_MASK) >> FINDMY_STATUS_BATTERY_SHIFT) {
+        case 0: return FINDMY_BATT_FULL;
+        case 1: return FINDMY_BATT_MEDIUM;
+        case 2: return FINDMY_BATT_LOW;
+        default: return FINDMY_BATT_CRITICAL;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tracker matching
 // ---------------------------------------------------------------------------
 
 static bool matchTracker(
     const NimBLEAdvertisedDevice *device, const String &lowerName, TrackerType &type, uint8_t &confidence,
-    const char *&label
+    const char *&label, uint8_t &rawStatus
 ) {
     // 1. Service UUIDs -- the most specific signal available.
     if (hasServiceUUID16(device, UUID_TILE)) {
@@ -105,25 +142,50 @@ static bool matchTracker(
     uint16_t mfgId = 0;
     std::string mfg;
     if (getMfgData(device, mfgId, mfg)) {
-        if (mfgId == APPLE_MFG_ID && mfg.size() >= 4) {
+        if (mfgId == APPLE_MFG_ID && mfg.size() >= 5) {
             uint8_t appleType = (uint8_t)mfg[2];
             uint8_t appleLen = (uint8_t)mfg[3];
+            uint8_t status = (uint8_t)mfg[4];
 
             if (appleType == APPLE_TYPE_FINDMY) {
-                // 0x12 + 0x19 -> separated tag broadcasting its rotating key.
-                // 0x12 + 0x02 -> owner's device nearby, or an iPhone/Mac advertising its own Find My
-                // presence.
-                if (appleLen == APPLE_FINDMY_LEN_SEPARATED) {
-                    type = TRACKER_AIRTAG;
-                    confidence = 95;
-                    label = "AirTag (separated)";
-                } else {
-                    type = TRACKER_OTHER_FIND_MY;
-                    confidence = 70;
-                    label = "Find My device";
+                bool maintained = (status & FINDMY_STATUS_MAINTAINED_MASK) != 0;
+                rawStatus = status;
+
+                if (appleLen == FINDMY_LEN_SEPARATED) {
+                    // A frame claiming 25 bytes must actually carry them.
+                    if (mfg.size() < 4 + FINDMY_LEN_SEPARATED) return false;
+
+                    if (!maintained) {
+                        // The one that matters: publishing its rotating key AND
+                        // no owner contact this rotation period.
+                        type = TRACKER_AIRTAG;
+                        confidence = 95;
+                        label = "AirTag - owner gone 15+ mins";
+                    } else {
+                        // Separated form, but the owner was in contact within
+                        // the last 15 minutes. Almost certainly someone's own
+                        // tag in their own pocket.
+                        type = TRACKER_FIND_MY_WITH_OWNER;
+                        confidence = 80;
+                        label = "Find My - owner near";
+                    }
+                    return true;
                 }
+
+                if (appleLen == FINDMY_LEN_NEARBY) {
+                    // Short form: owner's device is present.
+                    type = TRACKER_FIND_MY_WITH_OWNER;
+                    confidence = 75;
+                    label = "Find My - owner near";
+                    return true;
+                }
+
+                type = TRACKER_OTHER_FIND_MY;
+                confidence = 60;
+                label = "Find My device";
                 return true;
             }
+
             if (appleType == APPLE_TYPE_PAIRING) {
                 if (nameContains(lowerName, "airpod")) {
                     type = TRACKER_AIRPODS;
@@ -286,59 +348,177 @@ static bool matchGlasses(
 
 // ---------------------------------------------------------------------------
 
-bool isTrackerDevice(
-    const NimBLEAdvertisedDevice *device, TrackerType &type, uint8_t &confidence, const char *&label
+static bool classifyAdvert(
+    const NimBLEAdvertisedDevice *device, TrackerType &type, uint8_t &confidence, const char *&label,
+    uint8_t &rawStatus
 ) {
     type = TRACKER_UNKNOWN;
     confidence = 0;
     label = "Unknown";
+    rawStatus = 0;
     if (!device) return false;
 
     String lowerName = device->getName().c_str();
     lowerName.toLowerCase();
 
     if (matchGlasses(device, lowerName, type, confidence, label)) return true;
-    if (matchTracker(device, lowerName, type, confidence, label)) return true;
+    if (matchTracker(device, lowerName, type, confidence, label, rawStatus)) return true;
 
     return false;
 }
 
 // ---------------------------------------------------------------------------
-// Proximity
+// Presence bookkeeping
 // ---------------------------------------------------------------------------
 
-OwnerProximity assessProximity(const TrackedDevice &device) {
-    int rssi = device.currentRSSI;
-    size_t n = device.rssiHistory.size();
-
-    if (n >= 6) {
-        size_t block = n / 3;
-        int oldSum = 0, newSum = 0;
-
-        for (size_t i = 0; i < block; i++) {
-            oldSum += device.rssiHistory[i];
-            newSum += device.rssiHistory[n - 1 - i];
-        }
-
-        int oldAvg = oldSum / (int)block;
-        int newAvg = newSum / (int)block;
-
-        if (newAvg < oldAvg - 6) return PROXIMITY_MOVING_AWAY;
-        if (newAvg > oldAvg + 6) return PROXIMITY_MOVING_NEAR;
-    }
-
+static OwnerProximity proximityFromRSSI(int rssi) {
+    if (rssi <= RSSI_NONE) return PROXIMITY_UNKNOWN;
     if (rssi > RSSI_STRONG) return PROXIMITY_NEAR;
     if (rssi > RSSI_MEDIUM) return PROXIMITY_MEDIUM;
     return PROXIMITY_FAR;
 }
 
+static uint32_t dwellMs(const CategoryPresence &c) {
+    if (c.consecutive == 0) return 0;
+    return c.lastSeenMs - c.runStartMs; // unsigned: survives millis() wrap
+}
+
+static DwellLevel dwellLevel(const CategoryPresence &c) {
+    if (c.consecutive == 0) return DWELL_NONE;
+
+    uint32_t d = dwellMs(c);
+    if (d >= DWELL_STRONG_MS && c.cyclesPresent * 2 >= g_totalCycles) return DWELL_STRONG;
+    if (d >= DWELL_ALERT_MS) return DWELL_ALERT;
+    if (d >= DWELL_WATCH_MS) return DWELL_WATCH;
+    return DWELL_PRESENT;
+}
+
+// How many distinct addresses ONE device would be expected to have shown over
+// this dwell. Observed far above expected means a crowd, not a follower.
+static uint16_t expectedAddrs(const CategoryPresence &c) { return 1 + (uint16_t)(dwellMs(c) / ROTATION_MS); }
+
+static void resetPresence() {
+    for (uint8_t i = 0; i < TRACKER_TYPE_COUNT; i++) {
+        CategoryPresence &c = g_presence[i];
+        c.everSeen = false;
+        c.runStartMs = 0;
+        c.lastSeenMs = 0;
+        c.maxDwellMs = 0;
+        c.missedCycles = 0;
+        c.cyclesPresent = 0;
+        c.consecutive = 0;
+        c.maxConsecutive = 0;
+        c.bestRSSI = RSSI_NONE;
+        c.lastRSSI = RSSI_NONE;
+        c.proximity = PROXIMITY_UNKNOWN;
+        c.confidence = 0;
+        c.label = "";
+        c.name = "";
+        c.battery = FINDMY_BATT_UNKNOWN;
+        c.rawStatus = 0;
+        c.addrCount = 0;
+        c.addrOverflow = false;
+        c.cycleHit = false;
+        c.cycleBestRSSI = RSSI_NONE;
+    }
+    g_totalCycles = 0;
+    g_startedMs = millis();
+}
+
+static void noteAddress(CategoryPresence &c, const String &address) {
+    uint32_t hash = 2166136261UL; // FNV-1a
+    for (size_t i = 0; i < address.length(); i++) {
+        hash ^= (uint8_t)address[i];
+        hash *= 16777619UL;
+    }
+
+    for (uint8_t i = 0; i < c.addrCount; i++) {
+        if (c.addrHashes[i] == hash) return;
+    }
+    if (c.addrCount >= MAX_ADDRS_PER_CATEGORY) {
+        c.addrOverflow = true;
+        return;
+    }
+    c.addrHashes[c.addrCount++] = hash;
+}
+
+static void onClassifiedAdvert(
+    TrackerType type, uint8_t confidence, const char *label, uint8_t rawStatus, int rssi,
+    const String &address, const String &name
+) {
+    if (type == TRACKER_UNKNOWN || type >= TRACKER_TYPE_COUNT) return;
+
+    // Too far away to be meaningful -- do not let it accumulate dwell.
+    if (rssi < RSSI_WEAK) return;
+
+    CategoryPresence &c = g_presence[type];
+
+    c.cycleHit = true;
+    if (rssi > c.cycleBestRSSI) c.cycleBestRSSI = rssi;
+
+    if (confidence > c.confidence) {
+        c.confidence = confidence;
+        c.label = label;
+    }
+    if (c.name.isEmpty() && !name.isEmpty()) c.name = name;
+    if (rawStatus != 0 || c.rawStatus == 0) {
+        c.rawStatus = rawStatus;
+        c.battery = decodeBattery(rawStatus);
+    }
+
+    noteAddress(c, address);
+}
+
+static void closePresenceCycle() {
+    uint32_t now = millis();
+    g_totalCycles++;
+
+    for (uint8_t i = 0; i < TRACKER_TYPE_COUNT; i++) {
+        CategoryPresence &c = g_presence[i];
+
+        if (c.cycleHit) {
+            c.missedCycles = 0;
+            if (c.consecutive == 0) c.runStartMs = now; // new run begins
+            c.consecutive++;
+            if (c.consecutive > c.maxConsecutive) c.maxConsecutive = c.consecutive;
+
+            c.cyclesPresent++;
+            c.everSeen = true;
+            c.lastSeenMs = now;
+            c.lastRSSI = c.cycleBestRSSI;
+            c.proximity = proximityFromRSSI(c.cycleBestRSSI);
+            if (c.cycleBestRSSI > c.bestRSSI) c.bestRSSI = c.cycleBestRSSI;
+
+            uint32_t d = dwellMs(c);
+            if (d > c.maxDwellMs) c.maxDwellMs = d;
+        } else if (c.consecutive > 0) {
+            // A single empty cycle is advert timing jitter, not a departure.
+            c.missedCycles++;
+            if (c.missedCycles >= MISSED_CYCLES_TO_END_RUN) {
+                c.consecutive = 0;
+                c.missedCycles = 0;
+                c.proximity = PROXIMITY_UNKNOWN;
+                c.lastRSSI = RSSI_NONE;
+            }
+        }
+
+        c.cycleHit = false;
+        c.cycleBestRSSI = RSSI_NONE;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Strings
+// ---------------------------------------------------------------------------
+
 String getTrackerTypeString(TrackerType type) {
     switch (type) {
         case TRACKER_AIRTAG: return "AirTag";
+        case TRACKER_FIND_MY_WITH_OWNER: return "FindMy+own";
+        case TRACKER_OTHER_FIND_MY: return "Find My";
         case TRACKER_TILE: return "Tile";
         case TRACKER_SMARTTAG: return "SmartTag";
         case TRACKER_AIRPODS: return "AirPods";
-        case TRACKER_OTHER_FIND_MY: return "Find My";
         case GLASSES_META: return "META GLASSES";
         case GLASSES_SNAP: return "SPECTACLES";
         case GLASSES_OTHER: return "GLASSES";
@@ -347,19 +527,85 @@ String getTrackerTypeString(TrackerType type) {
     }
 }
 
-String getProximityString(OwnerProximity prox) {
-    switch (prox) {
-        case PROXIMITY_NEAR: return "NEAR";
-        case PROXIMITY_MEDIUM: return "MEDIUM";
-        case PROXIMITY_FAR: return "FAR";
-        case PROXIMITY_MOVING_AWAY: return "MOVING AWAY";
-        case PROXIMITY_MOVING_NEAR: return "MOVING NEAR";
-        default: return "UNKNOWN";
+static String getTrackerShortString(TrackerType type) {
+    switch (type) {
+        case TRACKER_AIRTAG: return "AIRTAG";
+        case TRACKER_FIND_MY_WITH_OWNER: return "APPLE DEVICE & OWNER";
+        case TRACKER_OTHER_FIND_MY: return "APPLE DEVICE, NO OWNER";
+        case TRACKER_TILE: return "TRACKER TILE";
+        case TRACKER_SMARTTAG: return "SMART TAG";
+        case TRACKER_AIRPODS: return "AIRPODS";
+        case GLASSES_META: return "META CAMERA GLASSES";
+        case GLASSES_SNAP: return "SNAPCHAT CAMERA GLASSES";
+        case GLASSES_OTHER: return "CAMERA GLASSES";
+        case GLASSES_CAMERA_GENERIC: return "GENERIC CAMERA GLASSES?";
+        default: return "?";
     }
 }
 
+String getProximityString(OwnerProximity prox) {
+    switch (prox) {
+        case PROXIMITY_NEAR: return "It's close!";
+        case PROXIMITY_MEDIUM: return "Not too far";
+        case PROXIMITY_FAR: return "Far away.";
+        default: return "--";
+    }
+}
+
+String getDwellLevelString(DwellLevel level) {
+    switch (level) {
+        case DWELL_STRONG: return "FOLLOWING";
+        case DWELL_ALERT: return "ALERT";
+        case DWELL_WATCH: return "WATCH";
+        case DWELL_PRESENT: return "present";
+        default: return "-";
+    }
+}
+
+String findMyBatteryString(FindMyBattery battery) {
+    switch (battery) {
+        case FINDMY_BATT_FULL: return "Full";
+        case FINDMY_BATT_MEDIUM: return "Medium";
+        case FINDMY_BATT_LOW: return "Low";
+        case FINDMY_BATT_CRITICAL: return "Critical";
+        default: return "Unknown";
+    }
+}
+
+static String formatDuration(uint32_t ms) {
+    uint32_t totalSec = ms / 1000;
+    char buf[16];
+    if (totalSec < 60) {
+        snprintf(buf, sizeof(buf), "%lus", (unsigned long)totalSec);
+    } else {
+        snprintf(
+            buf, sizeof(buf), "%lum%02lus", (unsigned long)(totalSec / 60), (unsigned long)(totalSec % 60)
+        );
+    }
+    return String(buf);
+}
+
+static String formatDurationShort(uint32_t ms) {
+    uint32_t totalSec = ms / 1000;
+    char buf[12];
+    if (totalSec < 60) {
+        snprintf(buf, sizeof(buf), "%lus", (unsigned long)totalSec);
+    } else if (totalSec < 3600) {
+        snprintf(buf, sizeof(buf), "%lum", (unsigned long)(totalSec / 60));
+    } else {
+        snprintf(
+            buf,
+            sizeof(buf),
+            "%luh%02lum",
+            (unsigned long)(totalSec / 3600),
+            (unsigned long)((totalSec % 3600) / 60)
+        );
+    }
+    return String(buf);
+}
+
 // ---------------------------------------------------------------------------
-// Scan callbacks
+// Scan plumbing
 // ---------------------------------------------------------------------------
 
 class TrackerDeviceCallbacks : public NimBLEScanCallbacks {
@@ -367,88 +613,33 @@ class TrackerDeviceCallbacks : public NimBLEScanCallbacks {
         TrackerType type;
         uint8_t confidence;
         const char *label;
-        if (!isTrackerDevice(advertisedDevice, type, confidence, label)) return;
+        uint8_t rawStatus;
+        if (!classifyAdvert(advertisedDevice, type, confidence, label, rawStatus)) return;
 
-        String address = advertisedDevice->getAddress().toString().c_str();
-        int rssi = advertisedDevice->getRSSI();
-
-        auto it = trackedDevices.find(address);
-        if (it == trackedDevices.end()) {
-            TrackedDevice newDevice;
-            newDevice.address = address;
-            newDevice.name = advertisedDevice->getName().c_str();
-            newDevice.type = type;
-            newDevice.confidence = confidence;
-            newDevice.label = label;
-            newDevice.currentRSSI = rssi;
-            newDevice.lastRSSI = rssi;
-            newDevice.averageRSSI = rssi;
-            newDevice.lastSeen = millis();
-            newDevice.rssiHistory.push_back(rssi);
-            newDevice.proximity = assessProximity(newDevice);
-
-            trackedDevices[address] = newDevice;
-            return;
-        }
-
-        TrackedDevice &device = it->second;
-        device.lastRSSI = device.currentRSSI;
-        device.currentRSSI = rssi;
-        device.lastSeen = millis();
-
-        if (confidence > device.confidence) {
-            device.type = type;
-            device.confidence = confidence;
-            device.label = label;
-        }
-        if (device.name.isEmpty()) device.name = advertisedDevice->getName().c_str();
-
-        device.rssiHistory.push_back(rssi);
-        if (device.rssiHistory.size() > 10) device.rssiHistory.erase(device.rssiHistory.begin());
-
-        int sum = 0;
-        for (int val : device.rssiHistory) sum += val;
-        device.averageRSSI = sum / (int)device.rssiHistory.size();
-
-        device.proximity = assessProximity(device);
+        onClassifiedAdvert(
+            type,
+            confidence,
+            label,
+            rawStatus,
+            advertisedDevice->getRSSI(),
+            String(advertisedDevice->getAddress().toString().c_str()),
+            String(advertisedDevice->getName().c_str())
+        );
     }
 };
 
 static TrackerDeviceCallbacks trackerCallbacks;
 
-// ---------------------------------------------------------------------------
-// Scan-object state guard
-// ---------------------------------------------------------------------------
-
-// NimBLE keeps a single NimBLEScan instance for the life of the firmware.
-// Bruce's stopBLEStack() calls BLEDevice::deinit() without clearAll, and
-// NimBLEDevice::deinit(false) leaves m_pScan allocated -- so that object, and
-// every setting written to it, survives a teardown and is handed straight back
-// by the next BLEDevice::getScan().
-//
-// ble_scan_setup() re-applies the callbacks, active-scan flag, interval, window
-// and duplicate filter, but it does NOT touch maxResults. Leaving maxResults at
-// 0 here therefore breaks every later scan that reads getResults() -- including
-// Bruce's own BLE Scan menu, whose g_scanCallbacks is an empty class and which
-// relies entirely on the buffered result list. It reports "No devices found"
-// until the board is rebooted.
-//
-// This guard restores the NimBLEScan constructor defaults on every exit path.
 namespace {
 struct ScanSettingsGuard {
     BLEScan *scan;
-
     explicit ScanSettingsGuard(BLEScan *s) : scan(s) {}
-
     ScanSettingsGuard(const ScanSettingsGuard &) = delete;
     ScanSettingsGuard &operator=(const ScanSettingsGuard &) = delete;
-
     ~ScanSettingsGuard() {
         if (scan == nullptr) return;
-        // Passing nullptr restores NimBLE's internal default callbacks, and the
-        // second argument restores the duplicate filter to its default (on).
         scan->setScanCallbacks(nullptr, false);
-        scan->setMaxResults(NIMBLE_DEFAULT_MAX_RESULTS);
+        scan->setMaxResults(NIMBLE_SCAN_DEFAULT_MAX_RESULTS);
     }
 };
 } // namespace
@@ -457,77 +648,272 @@ struct ScanSettingsGuard {
 // UI
 // ---------------------------------------------------------------------------
 
-void displayTrackerInfo(const String &address, const TrackedDevice &device) {
+static uint16_t levelColor(DwellLevel level) {
+    switch (level) {
+        case DWELL_STRONG: return TFT_RED;
+        case DWELL_ALERT: return TFT_ORANGE;
+        case DWELL_WATCH: return TFT_YELLOW;
+        case DWELL_PRESENT: return TFT_GREEN;
+        default: return TFT_DARKGREY;
+    }
+}
+
+// Anything with a camera on it is red the moment it is seen, regardless of how
+// long it has been around -- presence is the whole point for glasses.
+static uint16_t rowColor(TrackerType type, DwellLevel level) {
+    if (isGlassesType(type)) return TFT_RED;
+    return levelColor(level);
+}
+
+// drawStatusBar() prints the clock (or "BRUCE <ver>") at (12,12) in a 60px
+// field. Paint over it without touching the border roundrect at x=5 or the
+// divider line at y=25. The status icons are centred, so they are well clear.
+static void hideStatusClock() { tft.fillRect(7, 7, 72, 17, bruceConfig.bgColor); }
+
+static void drawTrackerDetail(TrackerType type) {
+    const CategoryPresence &c = g_presence[type];
+
     tft.fillScreen(bruceConfig.bgColor);
     drawMainBorder();
-    tft.setTextColor(bruceConfig.priColor);
+    hideStatusClock();
+
+    tft.setTextSize(TITLE_TEXT_SIZE);
+    tft.setTextColor(isGlassesType(type) ? TFT_RED : bruceConfig.priColor, bruceConfig.bgColor);
     tft.drawCentreString(
-        isGlassesType(device.type) ? "-=Camera Device=-" : "-=Tracker Info=-", tftWidth / 2, 28, SMOOTH_FONT
+        isGlassesType(type) ? "Camera device" : "Tracker info", tftWidth / 2, UI_TOP, SMOOTH_FONT
     );
 
-    tft.setTextSize(1);
-    tft.setTextColor(bruceConfig.priColor);
-    tft.drawString(String(device.label), 10, 48);
-    tft.drawString("Match: " + String(device.confidence) + "%", 10, 66);
-    tft.drawString("Addr: " + address, 10, 84);
-    tft.drawString("RSSI: " + String(device.currentRSSI) + " / avg " + String(device.averageRSSI), 10, 102);
+    tft.setTextSize(DETAIL_TEXT_SIZE);
+    const int step = (DETAIL_TEXT_SIZE == FP ? 12 : 16);
+    int y = UI_TOP + (TITLE_TEXT_SIZE == FP ? 14 : 22);
+    const int bottom = tftHeight - 14;
 
-    uint16_t proxColor = bruceConfig.priColor;
-    if (device.proximity == PROXIMITY_NEAR || device.proximity == PROXIMITY_MOVING_NEAR) {
-        proxColor = TFT_RED;
-    } else if (device.proximity == PROXIMITY_MEDIUM) {
-        proxColor = TFT_YELLOW;
-    } else {
-        proxColor = TFT_GREEN;
+    tft.setTextColor(isGlassesType(type) ? TFT_RED : bruceConfig.priColor, bruceConfig.bgColor);
+    tft.drawString(String(c.label), 8, y);
+    y += step;
+
+    if (y + step <= bottom) {
+        tft.setTextColor(rowColor(type, dwellLevel(c)), bruceConfig.bgColor);
+        tft.drawString(formatDuration(dwellMs(c)) + "  " + getDwellLevelString(dwellLevel(c)), 8, y);
+        y += step;
     }
 
-    tft.setTextColor(proxColor);
-    tft.drawString("Status: " + getProximityString(device.proximity), 10, 120);
+    tft.setTextColor(bruceConfig.priColor, bruceConfig.bgColor);
 
-    tft.setTextColor(bruceConfig.priColor);
-    tft.drawCentreString("Press " + String(BTN_ALIAS) + " to back", tftWidth / 2, tftHeight - 20, 1);
+    if (y + step <= bottom) {
+        tft.drawString(
+            getProximityString(c.proximity) + "  " + String(c.lastRSSI) + "/" + String(c.bestRSSI), 8, y
+        );
+        y += step;
+    }
+    if (y + step <= bottom) {
+        tft.drawString(
+            "Addr " + String(c.addrCount) + (c.addrOverflow ? "+" : "") + "/exp " + String(expectedAddrs(c)),
+            8,
+            y
+        );
+        y += step;
+    }
+    if (y + step <= bottom &&
+        (type == TRACKER_AIRTAG || type == TRACKER_FIND_MY_WITH_OWNER || type == TRACKER_OTHER_FIND_MY)) {
+        char sbuf[40];
+        snprintf(sbuf, sizeof(sbuf), "Batt %s 0x%02X", findMyBatteryString(c.battery).c_str(), c.rawStatus);
+        tft.drawString(String(sbuf), 8, y);
+        y += step;
+    }
+    if (y + step <= bottom && !c.name.isEmpty()) {
+        tft.drawString(c.name, 8, y);
+        y += step;
+    }
+    if (y + step <= bottom) {
+        tft.drawString("Match " + String(c.confidence) + "%  max " + formatDurationShort(c.maxDwellMs), 8, y);
+        y += step;
+    }
 
+    tft.setTextSize(FP);
+    tft.drawCentreString("Press " + String(BTN_ALIAS) + " to back", tftWidth / 2, tftHeight - 12, 1);
     delay(300);
     while (!check(SelPress)) { yield(); }
 }
 
+static void openDetailList() {
+    std::vector<TrackerType> present;
+    for (uint8_t i = 1; i < TRACKER_TYPE_COUNT; i++) {
+        if (g_presence[i].everSeen) present.push_back((TrackerType)i);
+    }
+
+    if (present.empty()) {
+        displayError("Nothing detected yet");
+        delay(1200);
+        return;
+    }
+
+    // Most alarming first: glasses and long dwells above brief sightings.
+    std::sort(present.begin(), present.end(), [](TrackerType a, TrackerType b) {
+        DwellLevel la = dwellLevel(g_presence[a]);
+        DwellLevel lb = dwellLevel(g_presence[b]);
+        if (la != lb) return la > lb;
+        return g_presence[a].maxDwellMs > g_presence[b].maxDwellMs;
+    });
+
+    options.clear();
+    for (TrackerType t : present) {
+        String entry = "[" + getTrackerTypeString(t) + "] " + formatDuration(g_presence[t].maxDwellMs);
+        options.emplace_back(entry.c_str(), [t]() { drawTrackerDetail(t); });
+    }
+    addOptionToMainMenu();
+    loopOptions(options);
+    options.clear();
+}
+
+#define MONITOR_TITLE_Y UI_TOP
+#define MONITOR_COUNTDOWN_Y (UI_TOP + (TITLE_TEXT_SIZE == FP ? 12 : 18))
+#define MONITOR_ROWS_TOP (MONITOR_COUNTDOWN_Y + (ROW_TEXT_SIZE == FP ? 12 : 18))
+#define MONITOR_ROW_STEP (ROW_TEXT_SIZE == FP ? 11 : 18)
+
+static void drawMonitorChrome() {
+    tft.fillScreen(bruceConfig.bgColor);
+    drawMainBorder();
+    hideStatusClock();
+
+    tft.setTextColor(bruceConfig.priColor, bruceConfig.bgColor);
+    tft.setTextSize(TITLE_TEXT_SIZE);
+    tft.drawCentreString("Being watched??", tftWidth / 2, MONITOR_TITLE_Y, SMOOTH_FONT);
+
+    tft.setTextSize(FP); // footer stays small: it is a long hint string
+    tft.drawCentreString(String(BTN_ALIAS) + ": list   Esc: exit", tftWidth / 2, tftHeight - 12, 1);
+}
+
+// Redraws only the countdown line, so the list underneath does not flicker.
+static void drawCountdown(uint32_t msRemaining) {
+    uint32_t secs = (msRemaining + 999) / 1000;
+    tft.setTextSize(ROW_TEXT_SIZE);
+    tft.fillRect(8, MONITOR_COUNTDOWN_Y, tftWidth - 16, ROW_TEXT_SIZE == FP ? 10 : 16, bruceConfig.bgColor);
+    tft.setTextColor(bruceConfig.priColor, bruceConfig.bgColor);
+
+    String bar = "";
+    uint32_t total = SCAN_CYCLE_MS / 1000;
+    for (uint32_t i = 0; i < total; i++) bar += (i < secs) ? "|" : ".";
+
+    tft.drawString("Scanning.." + String(secs) + "s " + bar, 10, MONITOR_COUNTDOWN_Y);
+}
+
+static void drawMonitorRows() {
+    const int top = MONITOR_ROWS_TOP;
+    const int step = MONITOR_ROW_STEP;
+    int maxRows = (tftHeight - 12 - top) / step;
+    if (maxRows < 1) maxRows = 1;
+
+    tft.fillRect(8, top, tftWidth - 16, maxRows * step, bruceConfig.bgColor);
+    tft.setTextSize(ROW_TEXT_SIZE);
+
+    std::vector<TrackerType> rows;
+    for (uint8_t i = 1; i < TRACKER_TYPE_COUNT; i++) {
+        if (g_presence[i].consecutive > 0) rows.push_back((TrackerType)i);
+    }
+
+    if (rows.empty()) {
+        tft.setTextColor(TFT_DARKGREY, bruceConfig.bgColor);
+        tft.drawString("all clear", 8, top);
+        return;
+    }
+
+    // Glasses first, then longest dwell -- a camera in range outranks a tag
+    // that has merely been around a while.
+    std::sort(rows.begin(), rows.end(), [](TrackerType a, TrackerType b) {
+        if (isGlassesType(a) != isGlassesType(b)) return isGlassesType(a);
+        DwellLevel la = dwellLevel(g_presence[a]);
+        DwellLevel lb = dwellLevel(g_presence[b]);
+        if (la != lb) return la > lb;
+        return dwellMs(g_presence[a]) > dwellMs(g_presence[b]);
+    });
+
+    int shown = (int)rows.size() < maxRows ? (int)rows.size() : maxRows;
+    bool truncated = (int)rows.size() > maxRows;
+    if (truncated) shown = maxRows - 1; // leave the last line for the overflow note
+
+    int y = top;
+    for (int i = 0; i < shown; i++) {
+        const CategoryPresence &c = g_presence[rows[i]];
+        tft.setTextColor(rowColor(rows[i], dwellLevel(c)), bruceConfig.bgColor);
+        tft.drawString(
+            getTrackerShortString(rows[i]) + " " + getProximityString(c.proximity) + " " +
+                formatDurationShort(dwellMs(c)),
+            8,
+            y
+        );
+        y += step;
+    }
+
+    if (truncated) {
+        tft.setTextColor(TFT_DARKGREY, bruceConfig.bgColor);
+        tft.drawString("+" + String((int)rows.size() - shown) + " more", 8, y);
+    }
+}
+
 void ble_tracker_detector() {
     tft.fillScreen(bruceConfig.bgColor);
-    displayTextLine("Scanning...");
-    delay(2000);
+    displayTextLine("LOADING...");
 
-    trackedDevices.clear();
+    resetPresence();
 
-    // Only tear the stack down at the end if we were the ones who brought it
-    // up. Another module (BLE Suite, BLE HID, the BLE server) may already own
-    // an active session, and killing it from here would drop its connections.
     bool bleWasActiveBefore = BLEConnected || (BLEDevice::getServer() != nullptr);
 #if !defined(LITE_VERSION)
     bleWasActiveBefore =
         bleWasActiveBefore || BLEStateManager::isBLEActive() || BLEStateManager::getActiveClientCount() > 0;
 #endif
 
-    if (!ble_scan_setup() || !pBLEScan) { return; }
+    if (!ble_scan_setup() || !pBLEScan) {
+        displayError("Failed to init BLE scan");
+        return;
+    }
 
     {
-        // Restores maxResults and the callbacks when this block exits, by any
-        // path. See the comment on ScanSettingsGuard above -- without it, the
-        // next module to call getResults() silently sees nothing.
         ScanSettingsGuard guard(pBLEScan);
 
-        // true == report duplicates, so RSSI history builds up across the scan.
         pBLEScan->setScanCallbacks(&trackerCallbacks, true);
-
-        // Callback-only mode: process each advert in onResult and buffer
-        // nothing, which keeps heap use flat over a long scan.
         pBLEScan->setMaxResults(0);
         pBLEScan->clearResults();
 
-        displayTextLine("Nearly done! " + String(SCAN_TIME_MS / 1000) + "s");
+        drawMonitorChrome();
+        drawMonitorRows();
 
-        pBLEScan->getResults(SCAN_TIME_MS, false);
+        pBLEScan->start(0, false, true);
+
+        uint32_t cycleEnd = millis() + SCAN_CYCLE_MS;
+        uint32_t lastTick = 0;
+
+        while (!check(EscPress)) {
+            uint32_t now = millis();
+
+            if ((int32_t)(now - cycleEnd) >= 0) {
+                closePresenceCycle();
+                cycleEnd = now + SCAN_CYCLE_MS;
+                drawMonitorRows();
+                lastTick = 0; // force countdown repaint
+            }
+
+            if (now - lastTick >= 200) {
+                lastTick = now;
+                drawCountdown(cycleEnd - now);
+            }
+
+            if (check(SelPress)) {
+                pBLEScan->stop();
+                openDetailList();
+                drawMonitorChrome();
+                drawMonitorRows();
+                pBLEScan->start(0, false, true);
+                cycleEnd = millis() + SCAN_CYCLE_MS;
+            }
+
+            if (!pBLEScan->isScanning()) { pBLEScan->start(0, false, true); }
+
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+
         pBLEScan->stop();
-    } // guard restores the scan object's defaults here
+    }
 
     if (!bleWasActiveBefore) {
 #if !defined(LITE_VERSION)
@@ -537,35 +923,5 @@ void ble_tracker_detector() {
 #endif
     }
 
-    if (trackedDevices.empty()) {
-        displayError("Nothing detected");
-        delay(1500);
-        return;
-    }
-
-    // Glasses first, then trackers, each highest-confidence first.
-    std::vector<const TrackedDevice *> sorted;
-    for (auto &entry : trackedDevices) sorted.push_back(&entry.second);
-    std::sort(sorted.begin(), sorted.end(), [](const TrackedDevice *a, const TrackedDevice *b) {
-        if (isGlassesType(a->type) != isGlassesType(b->type)) return isGlassesType(a->type);
-        return a->confidence > b->confidence;
-    });
-
-    options.clear();
-    for (const TrackedDevice *device : sorted) {
-        String displayName = "[" + getTrackerTypeString(device->type) + "] ";
-        displayName += device->name.isEmpty() ? device->address : device->name;
-
-        String address = device->address;
-        options.emplace_back(displayName.c_str(), [address]() {
-            auto it = trackedDevices.find(address);
-            if (it != trackedDevices.end()) displayTrackerInfo(it->first, it->second);
-        });
-    }
-
-    addOptionToMainMenu();
-    loopOptions(options);
-
-    options.clear();
-    trackedDevices.clear();
+    openDetailList();
 }
