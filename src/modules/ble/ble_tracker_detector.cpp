@@ -49,7 +49,7 @@
 #define RSSI_MEDIUM -70 // above this: MEDIUM
 #define RSSI_WEAK -85   // below this: ignored entirely, too far to matter
 
-#define SCAN_CYCLE_MS 10000                // presence accounting granularity
+#define SCAN_CYCLE_MS 8000                 // how long to scan before updating the display
 #define ROTATION_MS (15UL * 60UL * 1000UL) // Apple key / BLE RPA rotation period
 
 #define DWELL_WATCH_MS (5UL * 60UL * 1000UL)
@@ -61,17 +61,24 @@
 // --- UI sizing --------------------------------------------------------------
 // setTextSize() takes a uint8_t.
 // Bruce's FP/FM/FG are 1/2/3 (i.e. small, medium, large font size)
-#define TITLE_TEXT_SIZE FM
+#define TITLE_TEXT_SIZE FP
 #define ROW_TEXT_SIZE FP
 #define DETAIL_TEXT_SIZE FP
 
 // drawStatusBar() owns y=0..25: clock at (12,12), SD/GPS/BLE icons centred at
 // y=7, divider line at y=25. Anything drawn above UI_TOP lands on top of them.
 #define UI_TOP 28
+#define UI_LEFT 8
+#define UI_CLEAR_W (tftWidth - 2 * UI_LEFT)
 
 static CategoryPresence g_presence[TRACKER_TYPE_COUNT];
 static uint16_t g_totalCycles = 0;
-static uint32_t g_startedMs = 0;
+
+// Categories currently in range, in display order. Only changes when a scan
+// cycle closes, so it is built once per cycle rather than per repaint -- the
+// scroll handler needs the count without rebuilding the list.
+static std::vector<TrackerType> g_monitorRows;
+static int g_monitorScroll = 0;
 
 // ---------------------------------------------------------------------------
 // Advertisement parsing helpers
@@ -128,7 +135,7 @@ static bool matchTracker(
     if (hasServiceUUID16(device, UUID_TILE)) {
         type = TRACKER_TILE;
         confidence = 95;
-        label = "Tile tracker";
+        label = "Tile tracker (Life360)";
         return true;
     }
     if (hasServiceUUID16(device, UUID_SMARTTAG_REG) || hasServiceUUID16(device, UUID_SMARTTAG_UNREG)) {
@@ -160,14 +167,14 @@ static bool matchTracker(
                         // no owner contact this rotation period.
                         type = TRACKER_AIRTAG;
                         confidence = 95;
-                        label = "AirTag - owner gone 15+ mins";
+                        label = "AirTag (not paired with owner)";
                     } else {
-                        // Separated form, but the owner was in contact within
+                        // Separated from, but the owner was in contact within
                         // the last 15 minutes. Almost certainly someone's own
                         // tag in their own pocket.
                         type = TRACKER_FIND_MY_WITH_OWNER;
                         confidence = 80;
-                        label = "Find My - owner near";
+                        label = "AirTag (paired with owner)";
                     }
                     return true;
                 }
@@ -176,13 +183,13 @@ static bool matchTracker(
                     // Short form: owner's device is present.
                     type = TRACKER_FIND_MY_WITH_OWNER;
                     confidence = 75;
-                    label = "Find My - owner near";
+                    label = "iPhone";
                     return true;
                 }
 
                 type = TRACKER_OTHER_FIND_MY;
                 confidence = 60;
-                label = "Find My device";
+                label = "Unknown Apple device";
                 return true;
             }
 
@@ -194,7 +201,7 @@ static bool matchTracker(
                 } else {
                     type = TRACKER_OTHER_FIND_MY;
                     confidence = 60;
-                    label = "Apple accessory (pairing)";
+                    label = "Apple accessory";
                 }
                 return true;
             }
@@ -205,7 +212,7 @@ static bool matchTracker(
         if (mfgId == TILE_MFG_ID) {
             type = TRACKER_TILE;
             confidence = 90;
-            label = "Tile tracker";
+            label = "Tile tracker (Life360)";
             return true;
         }
 
@@ -216,25 +223,25 @@ static bool matchTracker(
     }
 
     // 3. Name fallback for devices in pairing / unregistered mode.
-    if (nameContains(lowerName, "airpod")) {
+    if (nameContains(lowerName, "AirPod")) {
         type = TRACKER_AIRPODS;
         confidence = 80;
         label = "AirPods";
         return true;
     }
-    if (nameContains(lowerName, "tile")) {
+    if (nameContains(lowerName, "Tile")) {
         type = TRACKER_TILE;
         confidence = 75;
         label = "Tile tracker";
         return true;
     }
-    if (nameContains(lowerName, "smarttag")) {
+    if (nameContains(lowerName, "SmartTag")) {
         type = TRACKER_SMARTTAG;
         confidence = 80;
         label = "Samsung SmartTag";
         return true;
     }
-    if (nameContains(lowerName, "chipolo")) {
+    if (nameContains(lowerName, "Chipolo")) {
         type = TRACKER_OTHER_FIND_MY;
         confidence = 80;
         label = "Chipolo tracker";
@@ -273,8 +280,8 @@ static const GlassesRule GLASSES_RULES[] = {
     {LUXOTTICA_MFG_ID, 0,              "oakley",        GLASSES_META,           92, "Oakley Meta"            },
 
     // --- other vendors: company ID + product name -------------------------
-    {SNAP_MFG_ID,      0,              nullptr,         GLASSES_SNAP,           88, "Snap Spectacles"        },
-    {SNAP_MFG_ID,      0,              "spectacles",    GLASSES_SNAP,           92, "Snap Spectacles"        },
+    {SNAP_MFG_ID,      0,              nullptr,         GLASSES_SNAP,           88, "Snap glasses"           },
+    {SNAP_MFG_ID,      0,              "spectacles",    GLASSES_SNAP,           92, "Snap glasses"           },
     {VUZIX_MFG_ID,     0,              nullptr,         GLASSES_OTHER,          85, "Vuzix glasses"          },
     {EVEN_MFG_ID,      0,              nullptr,         GLASSES_OTHER,          85, "Even Realities glasses" },
     {SONY_MFG_ID,      0,              "smarteyeglass", GLASSES_OTHER,          90, "Sony SmartEyeglass"     },
@@ -422,7 +429,8 @@ static void resetPresence() {
         c.cycleBestRSSI = RSSI_NONE;
     }
     g_totalCycles = 0;
-    g_startedMs = millis();
+    g_monitorRows.clear();
+    g_monitorScroll = 0;
 }
 
 static void noteAddress(CategoryPresence &c, const String &address) {
@@ -514,8 +522,8 @@ static void closePresenceCycle() {
 String getTrackerTypeString(TrackerType type) {
     switch (type) {
         case TRACKER_AIRTAG: return "AirTag";
-        case TRACKER_FIND_MY_WITH_OWNER: return "FindMy+own";
-        case TRACKER_OTHER_FIND_MY: return "Find My";
+        case TRACKER_FIND_MY_WITH_OWNER: return "AirTag & Owner";
+        case TRACKER_OTHER_FIND_MY: return "Apple Device";
         case TRACKER_TILE: return "Tile";
         case TRACKER_SMARTTAG: return "SmartTag";
         case TRACKER_AIRPODS: return "AirPods";
@@ -529,25 +537,25 @@ String getTrackerTypeString(TrackerType type) {
 
 static String getTrackerShortString(TrackerType type) {
     switch (type) {
-        case TRACKER_AIRTAG: return "AIRTAG";
-        case TRACKER_FIND_MY_WITH_OWNER: return "APPLE DEVICE & OWNER";
-        case TRACKER_OTHER_FIND_MY: return "APPLE DEVICE, NO OWNER";
+        case GLASSES_META: return "META GLASSES";
+        case GLASSES_SNAP: return "SNAP GLASSES";
+        case GLASSES_OTHER: return "CAMERA GLASSES";
+        case GLASSES_CAMERA_GENERIC: return "CAMERA GLASSES?";
+        case TRACKER_AIRTAG: return "AIRTAG, NO OWNER";
+        case TRACKER_FIND_MY_WITH_OWNER: return "APPLE + OWNER";
+        case TRACKER_OTHER_FIND_MY: return "OTHER FIND MY";
         case TRACKER_TILE: return "TRACKER TILE";
         case TRACKER_SMARTTAG: return "SMART TAG";
         case TRACKER_AIRPODS: return "AIRPODS";
-        case GLASSES_META: return "META CAMERA GLASSES";
-        case GLASSES_SNAP: return "SNAPCHAT CAMERA GLASSES";
-        case GLASSES_OTHER: return "CAMERA GLASSES";
-        case GLASSES_CAMERA_GENERIC: return "GENERIC CAMERA GLASSES?";
         default: return "?";
     }
 }
 
 String getProximityString(OwnerProximity prox) {
     switch (prox) {
-        case PROXIMITY_NEAR: return "It's close!";
-        case PROXIMITY_MEDIUM: return "Not too far";
-        case PROXIMITY_FAR: return "Far away.";
+        case PROXIMITY_NEAR: return "very close";
+        case PROXIMITY_MEDIUM: return "nearby";
+        case PROXIMITY_FAR: return "far away";
         default: return "--";
     }
 }
@@ -557,7 +565,7 @@ String getDwellLevelString(DwellLevel level) {
         case DWELL_STRONG: return "FOLLOWING";
         case DWELL_ALERT: return "ALERT";
         case DWELL_WATCH: return "WATCH";
-        case DWELL_PRESENT: return "present";
+        case DWELL_PRESENT: return "& still nearby";
         default: return "-";
     }
 }
@@ -665,22 +673,16 @@ static uint16_t rowColor(TrackerType type, DwellLevel level) {
     return levelColor(level);
 }
 
-// drawStatusBar() prints the clock (or "BRUCE <ver>") at (12,12) in a 60px
-// field. Paint over it without touching the border roundrect at x=5 or the
-// divider line at y=25. The status icons are centred, so they are well clear.
-static void hideStatusClock() { tft.fillRect(7, 7, 72, 17, bruceConfig.bgColor); }
-
 static void drawTrackerDetail(TrackerType type) {
     const CategoryPresence &c = g_presence[type];
 
     tft.fillScreen(bruceConfig.bgColor);
     drawMainBorder();
-    hideStatusClock();
 
     tft.setTextSize(TITLE_TEXT_SIZE);
     tft.setTextColor(isGlassesType(type) ? TFT_RED : bruceConfig.priColor, bruceConfig.bgColor);
     tft.drawCentreString(
-        isGlassesType(type) ? "Camera device" : "Tracker info", tftWidth / 2, UI_TOP, SMOOTH_FONT
+        isGlassesType(type) ? "Camera device" : "Tracker info", tftWidth / 2, UI_TOP + 2, SMOOTH_FONT
     );
 
     tft.setTextSize(DETAIL_TEXT_SIZE);
@@ -689,26 +691,27 @@ static void drawTrackerDetail(TrackerType type) {
     const int bottom = tftHeight - 14;
 
     tft.setTextColor(isGlassesType(type) ? TFT_RED : bruceConfig.priColor, bruceConfig.bgColor);
-    tft.drawString(String(c.label), 8, y);
+    tft.drawString(" " + String(c.label), 8, y);
     y += step;
-
-    if (y + step <= bottom) {
-        tft.setTextColor(rowColor(type, dwellLevel(c)), bruceConfig.bgColor);
-        tft.drawString(formatDuration(dwellMs(c)) + "  " + getDwellLevelString(dwellLevel(c)), 8, y);
-        y += step;
-    }
 
     tft.setTextColor(bruceConfig.priColor, bruceConfig.bgColor);
 
     if (y + step <= bottom) {
-        tft.drawString(
-            getProximityString(c.proximity) + "  " + String(c.lastRSSI) + "/" + String(c.bestRSSI), 8, y
-        );
+        tft.drawString(" It was generally " + getProximityString(c.proximity), 8, y);
+        y += step;
+    }
+    if (y + step <= bottom) {
+        tft.drawString(" Most recent signal strength: " + String(c.lastRSSI), 8, y);
+        y += step;
+    }
+    if (y + step <= bottom) {
+        tft.drawString(" Max signal strength heard: " + String(c.bestRSSI), 8, y);
         y += step;
     }
     if (y + step <= bottom) {
         tft.drawString(
-            "Addr " + String(c.addrCount) + (c.addrOverflow ? "+" : "") + "/exp " + String(expectedAddrs(c)),
+            " Total addresses: " + String(c.addrCount) + (c.addrOverflow ? "+" : "") +
+                ". Expected: " + String(expectedAddrs(c)),
             8,
             y
         );
@@ -717,38 +720,31 @@ static void drawTrackerDetail(TrackerType type) {
     if (y + step <= bottom &&
         (type == TRACKER_AIRTAG || type == TRACKER_FIND_MY_WITH_OWNER || type == TRACKER_OTHER_FIND_MY)) {
         char sbuf[40];
-        snprintf(sbuf, sizeof(sbuf), "Batt %s 0x%02X", findMyBatteryString(c.battery).c_str(), c.rawStatus);
+        snprintf(sbuf, sizeof(sbuf), " Device's battery level is %s", findMyBatteryString(c.battery).c_str());
         tft.drawString(String(sbuf), 8, y);
         y += step;
     }
-    if (y + step <= bottom && !c.name.isEmpty()) {
-        tft.drawString(c.name, 8, y);
-        y += step;
-    }
-    if (y + step <= bottom) {
-        tft.drawString("Match " + String(c.confidence) + "%  max " + formatDurationShort(c.maxDwellMs), 8, y);
-        y += step;
-    }
 
-    tft.setTextSize(FP);
-    tft.drawCentreString("Press " + String(BTN_ALIAS) + " to back", tftWidth / 2, tftHeight - 12, 1);
+    tft.setTextSize(ROW_TEXT_SIZE);
+    tft.drawCentreString(
+        "Press " + String(BTN_ALIAS) + " to go back", tftWidth / 2, tftHeight - 17, SMOOTH_FONT
+    );
     delay(300);
     while (!check(SelPress)) { yield(); }
 }
 
 static void openDetailList() {
     std::vector<TrackerType> present;
-    for (uint8_t i = 1; i < TRACKER_TYPE_COUNT; i++) {
+    for (uint8_t i = 0; i < TRACKER_TYPE_COUNT; i++) {
         if (g_presence[i].everSeen) present.push_back((TrackerType)i);
     }
 
     if (present.empty()) {
-        displayError("Nothing detected yet");
-        delay(1200);
+        displayError("No trackers or glasses found - weird");
+        // delay(1200);
         return;
     }
 
-    // Most alarming first: glasses and long dwells above brief sightings.
     std::sort(present.begin(), present.end(), [](TrackerType a, TrackerType b) {
         DwellLevel la = dwellLevel(g_presence[a]);
         DwellLevel lb = dwellLevel(g_presence[b]);
@@ -758,69 +754,76 @@ static void openDetailList() {
 
     options.clear();
     for (TrackerType t : present) {
-        String entry = "[" + getTrackerTypeString(t) + "] " + formatDuration(g_presence[t].maxDwellMs);
+        tft.setTextSize(ROW_TEXT_SIZE == 12);
+        String entry =
+            getTrackerTypeString(t) + " was nearby for " + formatDuration(g_presence[t].maxDwellMs);
         options.emplace_back(entry.c_str(), [t]() { drawTrackerDetail(t); });
     }
     addOptionToMainMenu();
+    tft.setTextSize(ROW_TEXT_SIZE == 12);
     loopOptions(options);
     options.clear();
 }
 
-#define MONITOR_TITLE_Y UI_TOP
-#define MONITOR_COUNTDOWN_Y (UI_TOP + (TITLE_TEXT_SIZE == FP ? 12 : 18))
-#define MONITOR_ROWS_TOP (MONITOR_COUNTDOWN_Y + (ROW_TEXT_SIZE == FP ? 12 : 18))
-#define MONITOR_ROW_STEP (ROW_TEXT_SIZE == FP ? 11 : 18)
+#define MONITOR_TAGLINE_Y (UI_TOP + 3)
+#define MONITOR_COUNTDOWN_Y (MONITOR_TAGLINE_Y + 15)
+#define MONITOR_ROWS_TOP (MONITOR_COUNTDOWN_Y + 15)
+#define MONITOR_ROW_STEP (ROW_TEXT_SIZE + 13)
 
 static void drawMonitorChrome() {
     tft.fillScreen(bruceConfig.bgColor);
     drawMainBorder();
-    hideStatusClock();
 
-    tft.setTextColor(bruceConfig.priColor, bruceConfig.bgColor);
-    tft.setTextSize(TITLE_TEXT_SIZE);
-    tft.drawCentreString("Being watched??", tftWidth / 2, MONITOR_TITLE_Y, SMOOTH_FONT);
+    tft.setTextSize(FP);
+    tft.drawCentreString(
+        String(BTN_ALIAS) + " = device selection | Esc = quit", tftWidth / 2, tftHeight - 16, SMOOTH_FONT
+    );
 
-    tft.setTextSize(FP); // footer stays small: it is a long hint string
-    tft.drawCentreString(String(BTN_ALIAS) + ": list   Esc: exit", tftWidth / 2, tftHeight - 12, 1);
+    tft.setTextSize(FP);
+    tft.setTextColor(TFT_WHITE, bruceConfig.bgColor);
+    tft.drawCentreString(
+        "Uncover nearby trackers & ai glasses", tftWidth / 2, MONITOR_TAGLINE_Y, SMOOTH_FONT
+    );
 }
 
-// Redraws only the countdown line, so the list underneath does not flicker.
 static void drawCountdown(uint32_t msRemaining) {
+    const uint32_t total = SCAN_CYCLE_MS / 1000;
     uint32_t secs = (msRemaining + 999) / 1000;
+    if (secs > total) secs = total;
+
     tft.setTextSize(ROW_TEXT_SIZE);
-    tft.fillRect(8, MONITOR_COUNTDOWN_Y, tftWidth - 16, ROW_TEXT_SIZE == FP ? 10 : 16, bruceConfig.bgColor);
+    tft.fillRect(UI_LEFT, MONITOR_COUNTDOWN_Y, UI_CLEAR_W, ROW_TEXT_SIZE + 5, bruceConfig.bgColor);
     tft.setTextColor(bruceConfig.priColor, bruceConfig.bgColor);
-
-    String bar = "";
-    uint32_t total = SCAN_CYCLE_MS / 1000;
-    for (uint32_t i = 0; i < total; i++) bar += (i < secs) ? "|" : ".";
-
-    tft.drawString("Scanning.." + String(secs) + "s " + bar, 10, MONITOR_COUNTDOWN_Y);
+    tft.drawCentreString(
+        "Refreshing in " + String(secs) + "s", tftWidth / 2, MONITOR_COUNTDOWN_Y, SMOOTH_FONT
+    );
 }
 
-static void drawMonitorRows() {
-    const int top = MONITOR_ROWS_TOP;
-    const int step = MONITOR_ROW_STEP;
-    int maxRows = (tftHeight - 12 - top) / step;
-    if (maxRows < 1) maxRows = 1;
+static int monitorMaxRows() {
+    const int bottomMargin = 17;
+    int maxRows = (tftHeight - bottomMargin - MONITOR_ROWS_TOP) / (MONITOR_ROW_STEP + 1);
+    return maxRows < 1 ? 1 : maxRows;
+}
 
-    tft.fillRect(8, top, tftWidth - 16, maxRows * step, bruceConfig.bgColor);
-    tft.setTextSize(ROW_TEXT_SIZE);
+// Rebuilds the visible row set. Call this when the presence data changed, not on
+// every repaint -- scrolling only moves a window over an unchanged list.
+static void rebuildMonitorRows() {
+    // The sort below re-runs every cycle, so a bare integer offset would end up
+    // pointing at a different category after a refresh and the list would appear
+    // to jump while being read. Pin the window to whatever was on the top line.
+    bool hadRows = !g_monitorRows.empty();
+    TrackerType pinned = TRACKER_UNKNOWN;
+    if (hadRows && g_monitorScroll < (int)g_monitorRows.size())
+        pinned = g_monitorRows[g_monitorScroll];
 
-    std::vector<TrackerType> rows;
-    for (uint8_t i = 1; i < TRACKER_TYPE_COUNT; i++) {
-        if (g_presence[i].consecutive > 0) rows.push_back((TrackerType)i);
+    g_monitorRows.clear();
+    for (uint8_t i = 0; i < TRACKER_TYPE_COUNT; i++) {
+        if (g_presence[i].consecutive > 0) g_monitorRows.push_back((TrackerType)i);
     }
 
-    if (rows.empty()) {
-        tft.setTextColor(TFT_DARKGREY, bruceConfig.bgColor);
-        tft.drawString("all clear", 8, top);
-        return;
-    }
-
-    // Glasses first, then longest dwell -- a camera in range outranks a tag
-    // that has merely been around a while.
-    std::sort(rows.begin(), rows.end(), [](TrackerType a, TrackerType b) {
+    // Glasses first, then longest dwell.
+    // A camera in range outranks a tag that has merely been around a while.
+    std::sort(g_monitorRows.begin(), g_monitorRows.end(), [](TrackerType a, TrackerType b) {
         if (isGlassesType(a) != isGlassesType(b)) return isGlassesType(a);
         DwellLevel la = dwellLevel(g_presence[a]);
         DwellLevel lb = dwellLevel(g_presence[b]);
@@ -828,16 +831,39 @@ static void drawMonitorRows() {
         return dwellMs(g_presence[a]) > dwellMs(g_presence[b]);
     });
 
-    int shown = (int)rows.size() < maxRows ? (int)rows.size() : maxRows;
-    bool truncated = (int)rows.size() > maxRows;
-    if (truncated) shown = maxRows - 1; // leave the last line for the overflow note
+    if (hadRows) {
+        g_monitorScroll = 0;
+        for (size_t i = 0; i < g_monitorRows.size(); i++) {
+            if (g_monitorRows[i] == pinned) {
+                g_monitorScroll = (int)i;
+                break;
+            }
+        }
+    }
+}
+
+static void drawMonitorRows() {
+    const int top = MONITOR_ROWS_TOP;
+    const int step = MONITOR_ROW_STEP + 1;
+    const int maxRows = monitorMaxRows();
+
+    tft.fillRect(8, top, tftWidth - 16, maxRows * step, bruceConfig.bgColor);
+
+    int maxScroll = (int)g_monitorRows.size() - maxRows;
+    if (maxScroll < 0) maxScroll = 0;
+    if (g_monitorScroll > maxScroll) g_monitorScroll = maxScroll;
+    if (g_monitorScroll < 0) g_monitorScroll = 0;
+
+    int shown = (int)g_monitorRows.size() - g_monitorScroll;
+    if (shown > maxRows) shown = maxRows;
 
     int y = top;
     for (int i = 0; i < shown; i++) {
-        const CategoryPresence &c = g_presence[rows[i]];
-        tft.setTextColor(rowColor(rows[i], dwellLevel(c)), bruceConfig.bgColor);
+        TrackerType type = g_monitorRows[g_monitorScroll + i];
+        const CategoryPresence &c = g_presence[type];
+        tft.setTextColor(rowColor(type, dwellLevel(c)), bruceConfig.bgColor);
         tft.drawString(
-            getTrackerShortString(rows[i]) + " " + getProximityString(c.proximity) + " " +
+            " " + getTrackerShortString(type) + ";" + " " + getProximityString(c.proximity) + " " +
                 formatDurationShort(dwellMs(c)),
             8,
             y
@@ -845,10 +871,11 @@ static void drawMonitorRows() {
         y += step;
     }
 
-    if (truncated) {
-        tft.setTextColor(TFT_DARKGREY, bruceConfig.bgColor);
-        tft.drawString("+" + String((int)rows.size() - shown) + " more", 8, y);
-    }
+    // Carets rather than a "+N more" line: on a 135px panel there are only three
+    // row slots, and spending one on an overflow note costs a third of the view.
+    tft.setTextColor(TFT_DARKGREY, bruceConfig.bgColor);
+    if (g_monitorScroll > 0) tft.drawString("^", tftWidth - 14, top);
+    if (g_monitorScroll < maxScroll) tft.drawString("v", tftWidth - 14, top + (shown - 1) * step);
 }
 
 void ble_tracker_detector() {
@@ -876,6 +903,7 @@ void ble_tracker_detector() {
         pBLEScan->clearResults();
 
         drawMonitorChrome();
+        rebuildMonitorRows();
         drawMonitorRows();
 
         pBLEScan->start(0, false, true);
@@ -889,6 +917,7 @@ void ble_tracker_detector() {
             if ((int32_t)(now - cycleEnd) >= 0) {
                 closePresenceCycle();
                 cycleEnd = now + SCAN_CYCLE_MS;
+                rebuildMonitorRows();
                 drawMonitorRows();
                 lastTick = 0; // force countdown repaint
             }
@@ -905,6 +934,17 @@ void ble_tracker_detector() {
                 drawMonitorRows();
                 pBLEScan->start(0, false, true);
                 cycleEnd = millis() + SCAN_CYCLE_MS;
+            }
+
+            // Repaint immediately instead of waiting for the countdown tick, so a
+            // scroll step lands as soon as the key is read.
+            if (check(PrevPress) && g_monitorScroll > 0) {
+                g_monitorScroll--;
+                drawMonitorRows();
+            }
+            if (check(NextPress)) {
+                g_monitorScroll++; // drawMonitorRows() clamps it back if that overshot
+                drawMonitorRows();
             }
 
             if (!pBLEScan->isScanning()) { pBLEScan->start(0, false, true); }

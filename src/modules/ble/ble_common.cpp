@@ -90,14 +90,6 @@ void stopBLEStack() {
     if (pBLEScan) {
         pBLEScan->stop();
         pBLEScan->clearResults();
-        // NimBLEDevice::deinit() below only deletes the NimBLEScan object when
-        // called with clearAll = true, which we never do -- so the object, and
-        // every setting written to it, outlives this teardown and is handed
-        // straight back by the next getScan(). Restore NimBLE's defaults so the
-        // modules that fetch the singleton directly (wardriving, ninebot, BLE
-        // Suite, the JS bindings) get a clean object rather than whatever the
-        // last module left behind. Passing nullptr for the callbacks also drops
-        // any callback pointer that is about to dangle.
         pBLEScan->setScanCallbacks(nullptr, false);
         pBLEScan->setMaxResults(NIMBLE_SCAN_DEFAULT_MAX_RESULTS);
         pBLEScan = nullptr;
@@ -167,12 +159,6 @@ bool ble_scan_setup() {
     pBLEScan->setInterval(SCAN_INT);
     pBLEScan->setWindow(SCAN_WINDOW);
     pBLEScan->setDuplicateFilter(false);
-    // The scan object is a shared singleton, so never assume the setting we
-    // got is the setting we left. A module that set maxResults to 0 (callback
-    // only) would otherwise make ble_scan() report "No devices found" forever,
-    // since g_scanCallbacks is empty and ble_scan() reads only the buffered
-    // list. Capping at MAX_DISPLAY_DEVICES also bounds heap use on low-RAM
-    // boards -- ble_scan() never shows more than that anyway.
     pBLEScan->setMaxResults(MAX_DISPLAY_DEVICES);
 
     esp_read_mac(sta_mac, ESP_MAC_BT);
